@@ -1,0 +1,54 @@
+-- Accesso esterno protetto: solo 150780.dev@gmail.com (login Google) puo' leggere e scrivere.
+-- Da incollare in Supabase > SQL Editor e eseguire (Run). Non modifica i dati esistenti.
+
+drop policy if exists "contacts_owner" on public.contacts;
+drop policy if exists "tickets_owner" on public.tickets;
+drop policy if exists "interventi_owner" on public.ticket_interventi;
+
+create policy "contacts_solo_proprietario" on public.contacts for all to authenticated
+  using (lower(coalesce((select auth.jwt()) ->> 'email','')) = '150780.dev@gmail.com')
+  with check (lower(coalesce((select auth.jwt()) ->> 'email','')) = '150780.dev@gmail.com');
+
+create policy "tickets_solo_proprietario" on public.tickets for all to authenticated
+  using (lower(coalesce((select auth.jwt()) ->> 'email','')) = '150780.dev@gmail.com')
+  with check (lower(coalesce((select auth.jwt()) ->> 'email','')) = '150780.dev@gmail.com');
+
+create policy "interventi_solo_proprietario" on public.ticket_interventi for all to authenticated
+  using (lower(coalesce((select auth.jwt()) ->> 'email','')) = '150780.dev@gmail.com')
+  with check (lower(coalesce((select auth.jwt()) ->> 'email','')) = '150780.dev@gmail.com');
+
+revoke all on public.contacts, public.tickets, public.ticket_interventi from anon;
+
+create or replace function public.ticket_timer_start(p_id uuid) returns boolean
+language sql security invoker set search_path = '' as $$
+  with u as (
+    update public.tickets
+       set timer_started_at = now(),
+           stato = case when stato = 'aperto' then 'in_lavorazione' else stato end
+     where id = p_id and timer_started_at is null and stato <> 'chiuso'
+    returning id)
+  select exists (select 1 from u)
+$$;
+
+create or replace function public.ticket_timer_stop(p_id uuid) returns json
+language sql security invoker set search_path = '' as $$
+  with old as (
+    select id, timer_started_at as s, timer_tipo
+      from public.tickets where id = p_id and timer_started_at is not null),
+  upd as (
+    update public.tickets set timer_started_at = null where id in (select id from old)),
+  ins as (
+    insert into public.ticket_interventi (ticket_id, tipo, dettaglio, durata_min, data_intervento)
+    select id, timer_tipo, 'Tempo registrato con il timer',
+           greatest(1, ceil(extract(epoch from (now() - s)) / 60))::int, s
+      from old
+    returning durata_min, tipo)
+  select json_build_object('n', (select count(*) from ins),
+                           'm', coalesce((select max(durata_min) from ins), 0),
+                           'tipo', (select max(tipo) from ins))
+$$;
+
+revoke all on function public.ticket_timer_start(uuid) from public, anon;
+revoke all on function public.ticket_timer_stop(uuid) from public, anon;
+grant execute on function public.ticket_timer_start(uuid) to authenticated;
+grant execute on function public.ticket_timer_stop(uuid) to authenticated;
